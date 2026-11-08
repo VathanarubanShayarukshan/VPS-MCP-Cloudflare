@@ -41,7 +41,7 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
 
 echo "[4/5] Preparing user services..."
 systemctl --user daemon-reload || true
-loginctl enable-linger "$USER"
+sudo loginctl enable-linger "$USER"
 export PATH="$HOME/bin:$PATH"
 
 if [[ -S "/run/user/$(id -u)/docker.sock" ]]; then
