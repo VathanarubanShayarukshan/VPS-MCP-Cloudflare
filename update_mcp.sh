@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Safely update VPS-MCP-Cloudflare from the GitHub main branch.
+# Safely update VPS-MCP-Cloudflare from GitHub.
 set -Eeuo pipefail
 
-REPO_URL="https://github.com/VathanarubanShayarukshan/VPS-MCP-Cloudflare.git"
 BRANCH="main"
+EXPECTED_ORIGIN="https://github.com/VathanarubanShayarukshan/VPS-MCP-Cloudflare.git"
 APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_DIR="$APP_DIR/backups"
 LOG_DIR="$APP_DIR/logs"
@@ -25,87 +25,88 @@ fail() {
   exit 1
 }
 
-restart_service() {
-  if [[ "$SERVICE_STOPPED" -eq 1 ]]; then
-    log "Starting MCP server and Cloudflare tunnel..."
-    if bash "$APP_DIR/start_mcp.sh" start; then
-      SERVICE_STOPPED=0
-      log "Services started."
-    else
-      log "WARNING: Automatic service start failed. Inspect logs with: bash start_mcp.sh logs"
-    fi
+start_services() {
+  log "Starting MCP server and Cloudflare tunnel..."
+  if bash "$APP_DIR/start_mcp.sh" start; then
+    SERVICE_STOPPED=0
+    log "Services started."
+  else
+    log "WARNING: Start failed. Check: bash start_mcp.sh logs"
+    return 1
   fi
 }
 
-rollback() {
+on_exit() {
   local rc=$?
+  trap - EXIT
   if [[ "$rc" -ne 0 ]]; then
     log "Update failed (exit $rc)."
     if [[ "$UPDATE_APPLIED" -eq 1 && -n "$OLD_COMMIT" ]]; then
       log "Rolling tracked source files back to $OLD_COMMIT..."
       git -C "$APP_DIR" reset --hard "$OLD_COMMIT" || log "WARNING: Git rollback failed."
+      if [[ -x "$APP_DIR/.venv/bin/python" && -f "$APP_DIR/requirements.txt" ]]; then
+        "$APP_DIR/.venv/bin/python" -m pip install -r "$APP_DIR/requirements.txt" >>"$LOG_FILE" 2>&1 || log "WARNING: Could not restore previous Python dependencies."
+      fi
     fi
-    restart_service
-    log "Backup, if created: $BACKUP_FILE"
+    if [[ "$SERVICE_STOPPED" -eq 1 ]]; then
+      start_services || true
+    fi
+    log "Review $LOG_FILE. Backup: $BACKUP_FILE"
   fi
   exit "$rc"
 }
-trap rollback EXIT
+trap on_exit EXIT
 
 cd "$APP_DIR"
-
 command -v git >/dev/null 2>&1 || fail "Git is not installed."
 command -v python3 >/dev/null 2>&1 || fail "Python 3 is not installed."
-[[ -f "$APP_DIR/start_mcp.sh" ]] || fail "start_mcp.sh is missing."
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "Run this script from inside the cloned Git repository."
+[[ "$(git branch --show-current)" == "$BRANCH" ]] || fail "Switch to the '$BRANCH' branch before updating."
+[[ -f "$APP_DIR/start_mcp.sh" ]] || fail "start_mcp.sh is missing."
 
 ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
-[[ "$ORIGIN" == "$REPO_URL" || "$ORIGIN" == "git@github.com:VathanarubanShayarukshan/VPS-MCP-Cloudflare.git" ]] || {
-  log "WARNING: origin remote is '$ORIGIN' (expected $REPO_URL)."
-}
+if [[ "$ORIGIN" != "$EXPECTED_ORIGIN" && "$ORIGIN" != "git@github.com:VathanarubanShayarukshan/VPS-MCP-Cloudflare.git" ]]; then
+  fail "Unexpected origin remote: $ORIGIN"
+fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
-  fail "Local Git changes detected. Commit, stash, or move them before updating; nothing was changed."
+  fail "Local Git changes detected. Commit or stash them first. No services have been stopped."
 fi
 
 OLD_COMMIT="$(git rev-parse HEAD)"
 log "Current version: $OLD_COMMIT"
 
-# Back up local token and workspace, if present. These are normally Git-ignored.
 backup_items=()
-[[ -f "$APP_DIR/.mcp_token" ]] && backup_items+=(".mcp_token")
-[[ -d "$APP_DIR/workspace" ]] && backup_items+=("workspace")
+[[ -f "$APP_DIR/.mcp_token" ]] && backup_items+=( ".mcp_token" )
+[[ -d "$APP_DIR/workspace" ]] && backup_items+=( "workspace" )
 if (("${#backup_items[@]}" > 0)); then
-  tar -czf "$BACKUP_FILE" -C "$APP_DIR" "${backup_items[@]}"
+  tar -czf "$BACKUP_FILE" -C "$APP_DIR" "${backup_items[@]}" || fail "Could not back up local token/workspace."
   chmod 600 "$BACKUP_FILE"
-  log "Local token/workspace backup created: $BACKUP_FILE"
+  log "Backup created: $BACKUP_FILE"
 else
-  log "No local token or workspace directory found; skipping data backup."
+  log "No token or workspace data found; skipping backup."
 fi
 
-log "Stopping MCP server and Cloudflare tunnel..."
+log "Stopping MCP services..."
 bash "$APP_DIR/start_mcp.sh" stop
 SERVICE_STOPPED=1
 
-log "Fetching GitHub branch '$BRANCH'..."
+log "Fetching origin/$BRANCH..."
 git fetch origin "$BRANCH"
-
-log "Applying fast-forward update..."
-git pull --ff-only origin "$BRANCH"
+git merge --ff-only "origin/$BRANCH"
 UPDATE_APPLIED=1
 
-log "Updating Python dependencies..."
+log "Installing Python dependencies..."
 if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
   python3 -m venv "$APP_DIR/.venv"
 fi
 "$APP_DIR/.venv/bin/python" -m pip install --upgrade pip
 "$APP_DIR/.venv/bin/python" -m pip install -r "$APP_DIR/requirements.txt"
 
-log "Rebuilding sandbox image and restarting services..."
-bash "$APP_DIR/start_mcp.sh" start
-SERVICE_STOPPED=0
+log "Rebuilding sandbox image and starting services..."
+start_services
 
 log "Update completed successfully."
-log "New version: $(git rev-parse HEAD)"
+log "Previous commit: $OLD_COMMIT"
+log "Current commit: $(git rev-parse HEAD)"
 log "Backup: ${BACKUP_FILE:-not created}"
-trap - EXIT
