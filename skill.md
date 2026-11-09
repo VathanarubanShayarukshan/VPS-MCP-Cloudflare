@@ -12,27 +12,19 @@
 - `list_files(path=".")`: list workspace entries.
 - `read_file(path)`: read a UTF-8 text file in the workspace.
 - `write_file(path, content)`: write a UTF-8 text file in the workspace.
-- `run_command(command)`: execute a Bash command inside the isolated Docker sandbox.
+- `run_command(command)`: run one supported native workspace operation.
 
 ## Command execution
-The sandbox permits ordinary shell commands and scripts available in the image. Examples include Bash, Python, Git, Node.js, package/build utilities, text-processing tools, and standard Ubuntu commands. Commands execute in the mounted workspace. Internet networking is disabled inside the sandbox.
+This project does not use Docker. The command tool is intentionally limited to:
+`pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `mkdir`, `touch`, and `rm` (files only).
 
-### Isolation controls
-- Docker daemon must be in rootless mode; the launcher refuses a non-rootless daemon.
-- Container network is disabled.
-- Container root filesystem is read-only.
-- Only the project workspace is mounted writable.
-- Linux capabilities are dropped; no-new-privileges is enabled.
-- CPU, memory, process count, file descriptors, and command duration are limited.
-- No Docker socket or host root filesystem is mounted into the container.
+Commands are parsed as arguments and are never passed to Bash or a shell. Pipes, redirects, command chaining, shell expansion, scripts, interpreters, and arbitrary executables are unsupported. File paths must resolve inside the MCP workspace. Use the dedicated file tools for normal file editing.
 
-## Safe operating procedure
-1. Inspect workspace files before editing.
-2. Keep generated files and project operations inside the workspace.
-3. Check command exit codes and output.
-4. Ask before destructive changes to user data.
-5. Do not try to bypass container restrictions, access host files, or retrieve credentials.
-6. If a required program is missing, ask the user to add it to `Dockerfile.sandbox` and rebuild the image.
-
-## Important
-This provides broad command access **inside the sandbox**, not unrestricted host VPS access. The host MCP process has access to the user's rootless Docker daemon, so protect the VPS account and MCP Bearer token. Rootless Docker reduces risk but is not a perfect security boundary; keep the host and Docker packages updated.
+## Safety
+- Treat the workspace as the only permitted file area for MCP file and command tools.
+- Do not attempt path traversal or access host secrets.
+- Ask before destructive file changes.
+- Do not claim this is a container or OS sandbox. The MCP server runs as its Linux service account, so that account's permissions define the process boundary.
+- Recommend running under a dedicated unprivileged Linux user, not root.
+- Never reveal or store the Bearer token in workspace files.
+- Keep the host patched and protect the Cloudflare endpoint and token.

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Bearer-authenticated MCP server with workspace tools and isolated Docker commands."""
+"""Bearer-authenticated MCP server with workspace-confined native tools."""
 import hmac
 import os
+import shlex
 import shutil
-import subprocess
 from pathlib import Path
 
 import uvicorn
@@ -16,10 +16,9 @@ WORKSPACE = Path(os.environ.get("MCP_WORKSPACE", BASE_DIR / "workspace")).resolv
 TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8000"))
-SANDBOX_IMAGE = os.environ.get("MCP_SANDBOX_IMAGE", "vps-mcp-sandbox:latest")
-COMMAND_TIMEOUT = int(os.environ.get("MCP_COMMAND_TIMEOUT", "120"))
 MAX_COMMAND_LENGTH = 8000
 MAX_FILE_BYTES = 1_000_000
+MAX_OUTPUT_CHARS = 20_000
 
 if len(TOKEN) < 32:
     raise SystemExit("MCP_AUTH_TOKEN must be set to a random value of at least 32 characters.")
@@ -80,59 +79,98 @@ def write_file(path: str, content: str) -> str:
 
 @mcp.tool()
 def run_command(command: str) -> dict:
-    """Run an arbitrary Bash command inside the isolated, network-disabled Docker sandbox.
+    """Run a small allowlist of native file/workspace commands without a shell.
 
-    Commands can read and modify only the mounted workspace. The container has
-    resource limits, a read-only root filesystem, dropped Linux capabilities,
-    and no access to the Docker socket or host root filesystem.
+    This is NOT a general Bash terminal. Commands and paths are restricted to
+    the MCP workspace. Shell operators, pipes, redirects, interpreters, and
+    arbitrary executables are intentionally unsupported.
     """
     if not isinstance(command, str) or not command.strip():
         raise ValueError("Provide a non-empty command.")
     if len(command) > MAX_COMMAND_LENGTH:
         raise ValueError(f"Command exceeds {MAX_COMMAND_LENGTH} characters.")
+    if any(ch in command for ch in (";", "|", "&", "`", "$", ">", "<", "\n", "\r")):
+        raise ValueError("Shell operators and multi-command input are not allowed.")
 
-    docker = shutil.which("docker")
-    if not docker:
-        raise RuntimeError("Docker CLI is not installed or is not on PATH.")
-
-    argv = [
-        docker, "run", "--rm",
-        "--network", "none",
-        "--read-only",
-        "--user", "0:0",
-        "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges:true",
-        "--pids-limit", "128",
-        "--memory", "512m",
-        "--memory-swap", "512m",
-        "--cpus", "1.0",
-        "--ulimit", "nofile=1024:1024",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m",
-        "--tmpfs", "/run:rw,nosuid,nodev,size=16m",
-        "--mount", f"type=bind,src={WORKSPACE},dst=/workspace,rw",
-        "--workdir", "/workspace",
-        "--env", "HOME=/tmp",
-        SANDBOX_IMAGE,
-        "bash", "-lc", command,
-    ]
     try:
-        result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
-            check=False, shell=False,
-        )
-        return {
-            "exit_code": result.returncode,
-            "stdout": result.stdout[-20000:],
-            "stderr": result.stderr[-8000:],
-            "sandbox": "Docker rootless daemon; network disabled",
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "exit_code": 124,
-            "stdout": (exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Command timed out inside the sandbox.",
-            "sandbox": "Docker rootless daemon; network disabled",
-        }
+        parts = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(f"Invalid command syntax: {exc}") from exc
+    if not parts:
+        raise ValueError("Provide a command.")
+
+    name, args = parts[0], parts[1:]
+    allowed = {"pwd", "ls", "cat", "head", "tail", "wc", "mkdir", "touch", "rm"}
+    if name not in allowed:
+        raise ValueError(f"Command not allowed. Allowed commands: {', '.join(sorted(allowed))}")
+
+    def get_target(value: str) -> Path:
+        if value.startswith("-"):
+            raise ValueError("Command options are not supported for path arguments.")
+        return safe_path(value)
+
+    output = ""
+    if name == "pwd":
+        if args:
+            raise ValueError("pwd takes no arguments.")
+        output = str(WORKSPACE)
+    elif name == "ls":
+        if len(args) > 1:
+            raise ValueError("ls accepts at most one workspace-relative path.")
+        target = get_target(args[0] if args else ".")
+        if not target.is_dir():
+            raise ValueError("ls target is not a directory.")
+        output = "\n".join(sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir()))
+    elif name == "cat":
+        if not args:
+            raise ValueError("cat requires at least one file path.")
+        chunks = []
+        for arg in args:
+            target = get_target(arg)
+            if not target.is_file() or target.stat().st_size > MAX_FILE_BYTES:
+                raise ValueError(f"Not a readable file within the 1 MB limit: {arg}")
+            chunks.append(target.read_text(encoding="utf-8"))
+        output = "".join(chunks)
+    elif name in {"head", "tail", "wc"}:
+        if len(args) != 1:
+            raise ValueError(f"{name} requires exactly one file path.")
+        target = get_target(args[0])
+        if not target.is_file() or target.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError("File is missing or exceeds the 1 MB limit.")
+        data = target.read_text(encoding="utf-8")
+        lines = data.splitlines()
+        if name == "head":
+            output = "\n".join(lines[:10])
+        elif name == "tail":
+            output = "\n".join(lines[-10:])
+        else:
+            output = f"{len(lines)} lines, {len(data.split())} words, {len(data.encode('utf-8'))} bytes"
+    elif name == "mkdir":
+        if not args:
+            raise ValueError("mkdir requires at least one directory path.")
+        for arg in args:
+            get_target(arg).mkdir(parents=True, exist_ok=True)
+        output = f"Created {len(args)} workspace director(ies)."
+    elif name == "touch":
+        if not args:
+            raise ValueError("touch requires at least one file path.")
+        for arg in args:
+            target = get_target(arg)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch(exist_ok=True)
+        output = f"Touched {len(args)} workspace file(s)."
+    elif name == "rm":
+        if not args:
+            raise ValueError("rm requires at least one file path.")
+        for arg in args:
+            target = get_target(arg)
+            if target.is_dir():
+                raise ValueError("rm only removes files, not directories.")
+            if target.exists():
+                target.unlink()
+        output = f"Removed {len(args)} workspace file(s) if present."
+
+    return {"exit_code": 0, "stdout": output[:MAX_OUTPUT_CHARS], "stderr": "", "execution": "restricted native; no shell; workspace-only paths"}
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
