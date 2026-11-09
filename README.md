@@ -1,60 +1,55 @@
 # VPS MCP Cloudflare
 
-A Python MCP server exposed through a Cloudflare Quick Tunnel. It provides authenticated workspace file operations and broad Bash command execution **inside a restricted Docker sandbox**.
+A Python MCP server exposed through a Cloudflare Quick Tunnel. It provides Bearer-authenticated workspace file operations and a **restricted native command tool**. Docker is not required or used.
 
-> **Security boundary:** Commands run in a rootless-Docker container with no network, a read-only container filesystem, dropped capabilities, resource limits, and only the project workspace mounted writable. This is not unrestricted host shell access.
+> **Security notice:** The command tool is deliberately not a general Bash terminal. It supports a small set of workspace operations without invoking a shell. This is not an OS-level sandbox. The MCP process still runs with the permissions of the Linux account that starts it. Use a dedicated, unprivileged VPS account and do not run this service as root.
 
 ## Features
 - MCP Streamable HTTP endpoint at `/mcp`
 - Bearer-token authentication
 - Workspace-confined file tools
-- Broad Bash command execution in Docker sandbox
-- Cloudflare Quick Tunnel in the background
+- Restricted native workspace commands (no shell, pipes, redirects, or arbitrary executables)
+- Cloudflare Quick Tunnel running in the background
 - Start, stop, restart, status, and logs commands
+- No Docker Engine, Docker daemon, Docker image, or Docker installation script
 
 ## Requirements
-- Ubuntu 24.04 (recommended)
-- Python 3.10+
+- Debian/Kali/Ubuntu Linux with Python 3.10+
+- `python3-venv` and `python3-pip`
 - Cloudflare `cloudflared` installed and available on PATH
-- Rootless Docker Engine
+- Git (for updates)
 - MCP client supporting remote Streamable HTTP and Bearer authentication
 
-## 1. Install rootless Docker
-Clone this repository, then run as your normal VPS user:
+## 1. Install system packages
+
+On Debian or Kali:
 
 ```bash
-chmod +x install_docker_rootless.sh start_mcp.sh
-./install_docker_rootless.sh
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git curl
 ```
 
-The installer uses the official Docker Ubuntu repository and configures rootless Docker for the current user. It may ask for your sudo password during package installation. Log out and back in after installation, then verify:
-
-```bash
-docker info --format '{{json .SecurityOptions}}'
-```
-
-The output must include `rootless`. Do not add your account to the `docker` group; that grants broad root-equivalent access to a rootful daemon.
-
-## 2. Install cloudflared
-Follow Cloudflare's official installation guide for your Ubuntu version:
+Install `cloudflared` using Cloudflare's official instructions:
 https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
 
-## 3. Start MCP
-From the repository directory:
+## 2. Start MCP
 
 ```bash
+chmod +x start_mcp.sh update_mcp.sh
 ./start_mcp.sh start
+``
+
+The launcher creates a Python virtual environment, installs requirements, generates a local token, and starts the MCP server and Cloudflare Quick Tunnel in the background.
+
+It prints the current MCP endpoint ending in `/mcp` and the Bearer token. Configure your MCP client with the endpoint and HTTP header:
+
+```
+Authorization: Bearer YOUR_TOKEN
 ```
 
-The launcher verifies rootless Docker, builds the sandbox image, installs Python dependencies, generates a local token, and starts the MCP server and Cloudflare tunnel in the background.
+Keep the token private. The Quick Tunnel URL can change after restart.
 
-It prints:
-- Current MCP endpoint, ending in `/mcp`
-- Bearer token (keep it private)
-
-Configure your MCP client with the endpoint and HTTP header `Authorization: Bearer YOUR_TOKEN`. Client configuration varies; it must support remote Streamable HTTP MCP with custom headers.
-
-## 4. Manage service
+## 3. Manage service
 
 ```bash
 ./start_mcp.sh status
@@ -63,25 +58,30 @@ Configure your MCP client with the endpoint and HTTP header `Authorization: Bear
 ./start_mcp.sh stop
 ```
 
-## Sandbox behavior
-The `run_command(command)` MCP tool accepts Bash commands and runs them inside the image built from `Dockerfile.sandbox`.
+## MCP tools
 
-Default restrictions:
-- Rootless Docker daemon required
-- `--network none`
-- Read-only container root filesystem
-- Only `workspace/` is mounted writable
-- All Linux capabilities dropped
-- `no-new-privileges`
-- 512 MiB memory, 1 CPU, 128 processes
-- 120-second command timeout
-- Output is truncated to bounded sizes
-- No host root filesystem or Docker socket mounted
+- `workspace_info()`: workspace location and free disk space.
+- `list_files(path=".")`: list workspace entries.
+- `read_file(path)`: read a UTF-8 file in the workspace (maximum 1 MB).
+- `write_file(path, content)`: write a UTF-8 file in the workspace (maximum 1 MB).
+- `run_command(command)`: restricted native workspace operations.
 
-The image includes common Ubuntu development and administration utilities. Add more packages to `Dockerfile.sandbox` and restart to rebuild the image. Network is disabled while commands run, so download dependencies during image build or add them to the image beforehand.
+### Restricted command tool
+
+Supported commands: `pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `mkdir`, `touch`, and `rm` (files only).
+
+The tool does not invoke Bash or another shell. Pipes, redirects, command chaining, shell expansion, interpreters, and arbitrary executables are rejected. Paths are resolved and checked to remain inside `workspace/`. Directory deletion is not supported by `rm`.
+
+This restriction reduces exposure but is not a security boundary equivalent to a container, VM, or OS sandbox. Never expose the MCP endpoint without its token, do not run the service as root, and consider using a dedicated low-privilege account.
 
 ## Workspace and secrets
-The default workspace is `workspace/`. Do not put credentials, SSH keys, tokens, or sensitive host files there. The local token is stored in `.mcp_token` with restrictive permissions and excluded from Git.
 
-## Limitations
-Rootless Docker is safer than giving an AI access to a rootful Docker socket, but it is not a perfect isolation boundary. Keep the host patched, use a dedicated VPS account, and do not expose the token. Quick Tunnel URLs are temporary and can change after restart.
+The default workspace is `workspace/`. Do not store SSH keys, credentials, or other secrets there. The token is stored in `.mcp_token` with restrictive permissions and should never be committed.
+
+## Update
+
+```bash
+./update_mcp.sh
+```
+
+The updater backs up the local token and workspace, updates the Git checkout, installs Python dependencies, and restarts the server. It does not build or run Docker images.
