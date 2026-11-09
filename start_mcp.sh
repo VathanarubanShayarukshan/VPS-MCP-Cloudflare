@@ -4,7 +4,6 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$ROOT/.venv"
 PY="$VENV/bin/python"
 PORT="${MCP_PORT:-8000}"
-IMAGE="${MCP_SANDBOX_IMAGE:-vps-mcp-sandbox:latest}"
 LOG_DIR="$ROOT/logs"
 PID_DIR="$ROOT/.run"
 SERVER_LOG="$LOG_DIR/mcp.log"
@@ -12,7 +11,6 @@ TUNNEL_LOG="$LOG_DIR/cloudflared.log"
 SERVER_PID="$PID_DIR/server.pid"
 TUNNEL_PID="$PID_DIR/tunnel.pid"
 TOKEN_FILE="$ROOT/.mcp_token"
-export DOCKER_HOST="${DOCKER_HOST:-unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock}"
 
 mkdir -p "$LOG_DIR" "$PID_DIR" "$ROOT/workspace"
 
@@ -25,8 +23,7 @@ stop_one() {
 status() {
   is_running "$SERVER_PID" && echo "MCP server: running (PID $(cat "$SERVER_PID"))" || echo "MCP server: stopped"
   is_running "$TUNNEL_PID" && echo "Cloudflare tunnel: running (PID $(cat "$TUNNEL_PID"))" || echo "Cloudflare tunnel: stopped"
-  [[ -f "$TOKEN_FILE" ]] && echo "Token: configured (stored locally)" || echo "Token: missing"
-  docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless && echo "Docker daemon: rootless" || echo "Docker daemon: not confirmed rootless"
+  [[ -s "$TOKEN_FILE" ]] && echo "Token: configured (stored locally)" || echo "Token: missing"
 }
 stop_all() {
   stop_one "$TUNNEL_PID"
@@ -40,13 +37,7 @@ start() {
     exit 0
   fi
   command -v cloudflared >/dev/null || { echo "cloudflared is not installed. See README.md."; exit 1; }
-  command -v docker >/dev/null || { echo "Docker CLI is missing. Run ./install_docker_rootless.sh first."; exit 1; }
-  docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless || {
-    echo "Refusing to start: Docker must be running in ROOTLESS mode."
-    echo "Run ./install_docker_rootless.sh, then log out/in and retry."
-    exit 1
-  }
-  docker build -t "$IMAGE" -f "$ROOT/Dockerfile.sandbox" "$ROOT"
+  command -v python3 >/dev/null || { echo "Python 3 is not installed."; exit 1; }
   [[ -x "$PY" ]] || python3 -m venv "$VENV"
   "$PY" -m pip install --upgrade pip
   "$PY" -m pip install -r "$ROOT/requirements.txt"
@@ -57,7 +48,6 @@ start() {
   fi
   export MCP_AUTH_TOKEN="$(cat "$TOKEN_FILE")"
   export MCP_PORT="$PORT"
-  export MCP_SANDBOX_IMAGE="$IMAGE"
   nohup "$PY" "$ROOT/vps_mcp_server.py" >>"$SERVER_LOG" 2>&1 &
   echo $! > "$SERVER_PID"
   sleep 2
